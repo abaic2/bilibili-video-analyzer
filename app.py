@@ -2,7 +2,10 @@
 """
 B站视频数据分析 · Streamlit 应用
 - 支持「搜索关键词选视频」或「直接输入 BV 号/链接」
-- 实时调用 B站公开 API（WBI 签名）获取视频信息与多页评论
+- 评论抓取支持两种模式：
+  · 快速模式：前 N 页（每页 20 条）
+  · 全量模式：按游标一直翻到抓完为止（带进度条 / 总量显示 / 风控退避 / 安全上限）
+- 实时调用 B站公开 API（WBI 签名）
 - 多维分析：KPI、发布时段、字数/点赞分布、关键词词频、词云、情感倾向、高赞 Top
 - 自包含：内置 Noto Sans SC 字体，云端中文正常渲染
 """
@@ -69,14 +72,22 @@ def wbi_sign(params):
     p["w_rid"] = hashlib.md5((q + mixin).encode()).hexdigest()
     return p
 
-def _get_json(url, params=None):
-    for _ in range(3):
+def _get_json(url, params=None, retries=5):
+    """带风控退避的 GET。B站限流会返回 code=-412，逐次加大等待重试。"""
+    for i in range(retries):
         try:
-            r = SESSION.get(url, params=params, timeout=15)
+            r = SESSION.get(url, params=params, timeout=20)
             if r.status_code == 200:
-                return r.json()
+                j = r.json()
+                if j.get("code") == -412:          # 请求过于频繁
+                    time.sleep(3 * (i + 1))
+                    continue
+                return j
+            if r.status_code in (412, 429):
+                time.sleep(3 * (i + 1))
+                continue
         except Exception:
-            time.sleep(1)
+            time.sleep(1.5)
     return {}
 
 # ---------------- 数据抓取 ----------------
@@ -113,11 +124,20 @@ def search_videos(keyword, limit=10):
             break
     return out
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_comments(aid, pages=20, mode=3):
-    comments = []
-    nxt = 0
-    for _ in range(pages):
+def fetch_comments_all(aid, fetch_all=False, max_pages=20, max_comments=100000,
+                       mode=3, delay=0.1, on_progress=None):
+    """
+    抓取评论。
+    fetch_all=False → 只抓前 max_pages 页；
+    fetch_all=True  → 一直翻页直到 is_end 或达到 max_comments。
+    on_progress(fetched, total) 每页回调一次用于更新进度。
+    返回 (comments, total)：total 为接口给出的评论总数（可能为 None）。
+    """
+    comments, nxt, page, total = [], 0, 0, None
+    while True:
+        page += 1
+        if not fetch_all and page > max_pages:
+            break
         params = wbi_sign({"type": 1, "oid": aid, "mode": mode, "next": nxt})
         d = _get_json("https://api.bilibili.com/x/v2/reply/wbi/main", params)
         if d.get("code") != 0:
@@ -136,13 +156,18 @@ def fetch_comments(aid, pages=20, mode=3):
                 "rpid": it["rpid"], "sex": it["member"].get("sex", ""),
             })
         cursor = data.get("cursor") or {}
+        total = cursor.get("all_count") or total
+        if on_progress:
+            on_progress(len(comments), total)
         if cursor.get("is_end"):
             break
         nxt = cursor.get("next", 0)
         if not nxt:
             break
-        time.sleep(0.2)
-    return comments
+        if len(comments) >= max_comments:
+            break
+        time.sleep(delay)
+    return comments, total
 
 # ---------------- 中文处理 ----------------
 STOPWORDS = set("""
@@ -235,65 +260,16 @@ def make_wordcloud(words):
     except Exception:
         return None
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="B站视频数据分析", page_icon="📊", layout="wide")
-st.title("📊 B站视频数据分析 · 评论挖掘")
-st.caption("实时调用 B站公开 API（WBI 签名）抓取真实数据 · 仅供学习演示")
-
-col_mode = st.container()
-with col_mode:
-    tab1, tab2 = st.tabs(["🔍 搜索选视频", "🔗 直接输入 BV / 链接"])
-    if "bvid" not in st.session_state:
-        st.session_state["bvid"] = ""
-    with tab1:
-        kw = st.text_input("输入关键词，搜索 B站视频", placeholder="例如：原神 / 何同学 / 美食")
-        if st.button("搜索", key="search"):
-            if kw.strip():
-                with st.spinner("搜索中…"):
-                    res = search_videos(kw.strip())
-                if res:
-                    labels = [f"{r['title']}  ·  UP {r['author']}  ·  {r['play']:,} 播放" for r in res]
-                    sel = st.selectbox("选择要分析视频", labels)
-                    st.session_state["bvid"] = res[labels.index(sel)]["bvid"]
-                    st.success(f"已选择：{st.session_state['bvid']}")
-                else:
-                    st.warning("未找到相关视频，换个关键词试试")
-    with tab2:
-        link = st.text_input("粘贴 BV 号或视频链接", placeholder="BV1GJ411x7h7 或 https://www.bilibili.com/video/BV1GJ411x7h7")
-        if link:
-            m = re.search(r"BV[0-9A-Za-z]+", link)
-            if m:
-                st.session_state["bvid"] = m.group(0)
-                st.success(f"识别到：{st.session_state['bvid']}")
-            else:
-                st.error("未识别到 BV 号")
-
-pages = st.slider("抓取评论页数（每页 20 条）", 1, 50, 20, help="页数越多，分析样本越大、耗时越长")
-analyze = st.button("🚀 开始分析", type="primary", use_container_width=True)
-
-if analyze:
-    bvid = st.session_state.get("bvid", "")
-    if not bvid:
-        st.error("请先选择或输入一个视频（BV 号）")
-        st.stop()
-    with st.spinner("正在抓取视频信息与评论…"):
-        video = fetch_video(bvid)
-    if not video:
-        st.error("视频信息获取失败，请检查 BV 号是否正确（该视频可能已下架或设为私密）")
-        st.stop()
-    with st.spinner("正在抓取评论…"):
-        comments = fetch_comments(video["aid"], pages)
-    if not comments:
-        st.warning("未能抓取到评论")
-        st.stop()
-
+# ---------------- 渲染结果 ----------------
+def render_result(video, comments):
     eng = video["like"] + video["coin"] + video["favorite"] + video["reply"]
     eng_rate = eng / video["view"] * 100 if video["view"] else 0
     pub = dt.datetime.fromtimestamp(video["pubdate"]).strftime("%Y-%m-%d %H:%M")
     sent = Counter(sentiment(c["message"]) for c in comments)
     avg_like = np.mean([c["like"] for c in comments]) if comments else 0
+    coverage = len(comments) / video["reply"] * 100 if video["reply"] else 0
 
-    st.header(f"{video['title']}")
+    st.header(video["title"])
     st.caption(f"UP主：{video['owner']} ｜ 分区：{video['tname']} ｜ 发布：{pub} ｜ {video['bvid']}")
 
     k1, k2, k3, k4 = st.columns(4)
@@ -307,8 +283,8 @@ if analyze:
     k7.metric("分享", f"{video['share']:,}")
     k8.metric("互动率", f"{eng_rate:.1f}%")
 
-    st.info(f"本次抓取评论 **{len(comments)}** 条 ｜ 平均点赞 **{avg_like:.1f}** ｜ "
-            f"情感：正面 {sent.get('正面',0)} / 中性 {sent.get('中性',0)} / 负面 {sent.get('负面',0)}")
+    st.info(f"本次抓取评论 **{len(comments):,}** 条（占全部约 **{coverage:.1f}%**）｜ 平均点赞 **{avg_like:.1f}** ｜ "
+            f"情感：正面 {sent.get('正面',0):,} / 中性 {sent.get('中性',0):,} / 负面 {sent.get('负面',0):,}")
 
     texts = [c["message"] for c in comments]
     words = cut_words(texts)
@@ -344,3 +320,81 @@ if analyze:
     st.table([{"用户": c["uname"], "评论": c["message"], "点赞": f"{c['like']:,}"} for c in top])
 
     st.caption(f"生成时间 {dt.datetime.now().strftime('%Y-%m-%d %H:%M')} · 数据来源 B站公开 API")
+
+# ---------------- UI ----------------
+st.set_page_config(page_title="B站视频数据分析", page_icon="📊", layout="wide")
+st.title("📊 B站视频数据分析 · 评论挖掘")
+st.caption("实时调用 B站公开 API（WBI 签名）抓取真实数据 · 仅供学习演示")
+
+if "bvid" not in st.session_state:
+    st.session_state["bvid"] = ""
+if "result" not in st.session_state:
+    st.session_state["result"] = None
+
+tab1, tab2 = st.tabs(["🔍 搜索选视频", "🔗 直接输入 BV / 链接"])
+with tab1:
+    kw = st.text_input("输入关键词，搜索 B站视频", placeholder="例如：原神 / 何同学 / 美食")
+    if st.button("搜索", key="search"):
+        if kw.strip():
+            with st.spinner("搜索中…"):
+                res = search_videos(kw.strip())
+            if res:
+                labels = [f"{r['title']}  ·  UP {r['author']}  ·  {r['play']:,} 播放" for r in res]
+                sel = st.selectbox("选择要分析视频", labels)
+                st.session_state["bvid"] = res[labels.index(sel)]["bvid"]
+                st.success(f"已选择：{st.session_state['bvid']}")
+            else:
+                st.warning("未找到相关视频，换个关键词试试")
+with tab2:
+    link = st.text_input("粘贴 BV 号或视频链接", placeholder="BV1GJ411x7h7 或 https://www.bilibili.com/video/BV1GJ411x7h7")
+    if link:
+        m = re.search(r"BV[0-9A-Za-z]+", link)
+        if m:
+            st.session_state["bvid"] = m.group(0)
+            st.success(f"识别到：{st.session_state['bvid']}")
+        else:
+            st.error("未识别到 BV 号")
+
+st.divider()
+scope = st.radio("抓取范围", ["快速模式（前 N 页）", "全量模式（抓取全部评论）"], horizontal=True)
+if scope.startswith("快速"):
+    pages = st.slider("抓取评论页数（每页约 20 条）", 1, 50, 20)
+    fetch_all, max_pages, max_comments = False, pages, 0
+else:
+    st.warning("全量模式会持续翻页直到抓完所有评论：**评论特别多的视频可能耗时较久**，"
+               "并可能触发站方风控限流（已内置自动退避重试）。建议先小范围试跑。")
+    cap = st.number_input("最多抓取评论数（安全上限）", min_value=1000, max_value=1000000,
+                          value=100000, step=1000)
+    fetch_all, max_pages, max_comments = True, 0, int(cap)
+
+analyze = st.button("🚀 开始分析", type="primary", use_container_width=True)
+if analyze:
+    bvid = st.session_state.get("bvid", "")
+    if not bvid:
+        st.error("请先选择或输入一个视频（BV 号）")
+        st.stop()
+    with st.spinner("正在获取视频信息…"):
+        video = fetch_video(bvid)
+    if not video:
+        st.error("视频信息获取失败，请检查 BV 号是否正确（该视频可能已下架或设为私密）")
+        st.stop()
+
+    progress = st.progress(0.0)
+    status = st.empty()
+    status.text("正在抓取评论…")
+    def _cb(fetched, total):
+        if total:
+            progress.progress(min(fetched / total, 1.0))
+        status.text(f"已抓取 {fetched:,} 条" + (f" / 共 {total:,} 条" if total else ""))
+    comments, total = fetch_comments_all(
+        video["aid"], fetch_all=fetch_all, max_pages=max_pages,
+        max_comments=max_comments, on_progress=_cb)
+    progress.progress(1.0)
+    status.text(f"抓取完成，共 {len(comments):,} 条评论")
+    if not comments:
+        st.warning("未能抓取到评论（可能该视频关闭了评论区）")
+        st.stop()
+    st.session_state["result"] = {"video": video, "comments": comments}
+
+if st.session_state.get("result"):
+    render_result(st.session_state["result"]["video"], st.session_state["result"]["comments"])
